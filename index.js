@@ -4,9 +4,55 @@ const octokit = require('@octokit/rest')();
 const colors = require('colors');
 const sprintf = require('sprintf-js').sprintf;
 const Spinner = require('cli-spinner').Spinner;
+const yargs = require('yargs');
 
-const apiToken = process.env.GHLIST_GITHUB_API_TOKEN;
-const apiUser = process.env.GHLIST_GITHUB_API_USER;
+const argv = yargs
+  .env('GHLIST')
+  .usage('Usage: $0 [options]')
+
+  .option('t', {
+    alias: 'githubApiToken',
+    nargs: 1,
+    describe: 'GitHub API token',
+    type: 'string'
+  })
+
+  .option('u', {
+    alias: 'githubApiUser',
+    nargs:  1,
+    describe: 'GitHub username',
+    type: 'string',
+  })
+  .example('$0 -u your_user_name', 'list open prs assigned to user')
+
+  .option('r', {
+    alias: 'repository',
+    describe: 'GitHub repository names',
+    nargs: 1,
+    type: 'string',
+  })
+  .example('$0 -r ann/xyz -r bob/abc', 'list open prs from multiple repositories')
+
+
+  .option('o', {
+    alias: 'organization',
+    describe: 'GitHub organization',
+    nargs: 1,
+    type: 'string'
+  })
+  .example('$0 -o some_org_name', 'list open prs on all repositories for some organization/user')
+
+  .help('h')
+  .alias('h', 'help')
+
+  .epilog('Happy reviewing!')
+  .argv;
+
+const apiToken = argv.t;
+const searchOrganization = argv.o;
+const searchRepositories = argv.r && !Array.isArray(argv.r) ? [argv.r] : argv.r; //ensure either array or undefined
+const searchUser = argv.u;
+const noUserMode = !!(searchOrganization || searchRepositories);
 
 octokit.authenticate({
   type: 'token',
@@ -15,23 +61,76 @@ octokit.authenticate({
 
 const allPRs = {};
 
+const getReviewRequested = (itemId, orgName, repoName, prNum) => {
+  return new Promise((resolve, reject) => {
+    octokit.pullRequests.getReviewRequests({
+      owner: orgName, repo: repoName, number: prNum, per_page: 1, page: 1
+    }).then((res) => {
+      if (res && res.data && res.data.users && res.data.teams) {
+        const count = res.data.users.length + res.data.teams.length;
+        if (count > 0) {
+          allPRs[itemId].statuses["requested"] = true;
+        }
+        resolve();
+      } else {
+        reject("no res");
+      }
+    });
+  });
+};
+
+const getReviewed = (itemId, orgName, repoName, prNum) => {
+  return new Promise((resolve, reject) => {
+    octokit.pullRequests.getReviews({
+      owner: orgName, repo: repoName, number: prNum, per_page: 1, page: 1
+    }).then((res) => {
+      resolve();
+      if (res && res.data) {
+        const count = res.data.length;
+        if (count > 0) {
+          allPRs[itemId].statuses["reviewed"] = true;
+        }
+        resolve();
+      } else {
+        reject("no res");
+      }
+    });
+  });
+};
+
 const addQueryToList = (q, status) => {
   return new Promise((resolve, reject) => {
     octokit.search.issues({
       q: q
     }).then((res) => {
       if (res && res.data && res.data.items) {
+        const furtherQueryPromises = [];
         res.data.items.forEach((item) => {
+          const prNum = item.number;
+          const prRepoUrlParts = item.repository_url.split('/');
+          const prRepoName = prRepoUrlParts[prRepoUrlParts.length-1];
+          const prOrgName = prRepoUrlParts[prRepoUrlParts.length-2];
+
           if (!allPRs[item.id]) {
             allPRs[item.id] = item;
-          } else {
           }
           if (!allPRs[item.id].statuses) {
-            allPRs[item.id].statuses = {}
+            allPRs[item.id].statuses = {};
           }
           allPRs[item.id].statuses[status] = true;
+
+          if (noUserMode) {
+            //get the assigned data from the item, and do additional requests for reviewed & review-requested status
+            //since no user is specified, it doesn't really make sense to check for mentions
+            const hasAssignee = item.assignees.length > 0;
+            if (hasAssignee) {
+              allPRs[item.id].statuses['assigned'] = true;
+            }
+            furtherQueryPromises.push(getReviewRequested(item.id, prOrgName, prRepoName, prNum));
+            furtherQueryPromises.push(getReviewed(item.id, prOrgName, prRepoName, prNum));
+          }
         });
-        resolve();
+        Promise.all(furtherQueryPromises).then(resolve);
       } else {
         reject("no res");
       }
@@ -85,15 +184,14 @@ const printItems = () => {
   const itemsSorted = sortItems(allItems);
   itemsSorted.forEach((item)=>{
     console.log(sprintf(
-      `  ${'%2s  %2s  %2s  %2s  %2s'}  ${'%s'.yellow}  [${'%s'.red}\n%44s[${'%-20s'.blue}      ${'%s'.magenta}\n`,
+      `  ${'%2s  %2s  %2s  %2s  %2s'}  ${'%s'.yellow}  ${'[%-72.72s]'.red}  ${'%-16.16s'.blue}  ${'%s'.magenta}\n`,
       (item.statuses.awaiting&&iconAW) || (item.statuses.created&&iconCR) || iconSPACE,
       (item.statuses.reviewed&&iconRV) || iconBLANK,
       (item.statuses.assigned&&iconAS) || iconBLANK,
       (item.statuses.requested&&iconRQ) || iconBLANK,
       (item.statuses.mentioned&&iconMN) || iconBLANK,
-      item.updated_at,
+      item.updated_at.replace(/[TZ]/g, ' '),
       item.title,
-      "",
       item.user.login,
       item.html_url
     ));
@@ -112,11 +210,27 @@ const printItems = () => {
   console.log();
 };
 
-const createdQ = `is:open is:pr author:${apiUser} archived:false`;
-const reviewedQ = `is:open is:pr reviewed-by:${apiUser} archived:false`;
-const requestedQ = `is:open is:pr review-requested:${apiUser} archived:false`;
-const assignedQ = `is:open is:pr assignee:${apiUser} archived:false`;
-const mentionedQ = `is:open is:pr mentions:${apiUser} archived:false`;
+const buildQueryPromises = () => {
+  let queries = [];
+  if (searchRepositories) {
+    queries = searchRepositories.map((r) => {
+      return {label: 'none', query: `is:open is:pr archived:false repo:${r}`};
+    });
+  } else if (searchOrganization) {
+    queries = [
+      {label: 'none', query: `is:open is:pr archived:false org:${searchOrganization}`}
+    ];
+  } else if (searchUser) {
+    queries = [
+      {label: 'created', query: `is:open is:pr archived:false author:${searchUser}`},
+      {label: 'reviewed', query: `is:open is:pr archived:false reviewed-by:${searchUser}`},
+      {label: 'requested', query: `is:open is:pr archived:false review-requested:${searchUser}`},
+      {label: 'assigned', query: `is:open is:pr archived:false assignee:${searchUser}`},
+      {label: 'mentioned', query: `is:open is:pr archived:false mentions:${searchUser}`},
+    ];
+  }
+  return queries.map((q) => addQueryToList(q.query, q.label));
+};
 
 console.log();
 const spinner = new Spinner(' Open PRs... %s');
@@ -125,13 +239,7 @@ spinner.setSpinnerDelay(100);
 spinner.start();
 
 //do all queries concurrently. resolve when they are all completed
-Promise.all([
-  addQueryToList(createdQ, "created"), 
-  addQueryToList(reviewedQ, "reviewed"), 
-  addQueryToList(requestedQ, "requested"),
-  addQueryToList(assignedQ, "assigned"),
-  addQueryToList(mentionedQ, "mentioned")
-]).then(()=>{
+Promise.all(buildQueryPromises()).then(()=>{
   spinner.stop(true);
   console.log(` Open PRs...`);
   printItems();
