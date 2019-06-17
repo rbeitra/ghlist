@@ -105,7 +105,9 @@ const addQueryToList = (q, status) => {
     }).then((res) => {
       if (res && res.data && res.data.items) {
         const furtherQueryPromises = [];
-        res.data.items.forEach((item) => {
+        //sometimes github returns closed items despite the "is:open" query
+        const actuallyOpen = res.data.items.filter((item) => item.state === 'open');
+        actuallyOpen.forEach((item) => {
           const prNum = item.number;
           const prRepoUrlParts = item.repository_url.split('/');
           const prRepoName = prRepoUrlParts[prRepoUrlParts.length-1];
