@@ -33,7 +33,6 @@ const argv = yargs
   })
   .example('$0 -r ann/xyz -r bob/abc', 'list open prs from multiple repositories')
 
-
   .option('o', {
     alias: 'organization',
     describe: 'GitHub organization',
@@ -41,6 +40,24 @@ const argv = yargs
     type: 'string'
   })
   .example('$0 -o some_org_name', 'list open prs on all repositories for some organization/user')
+
+  .option('i', {
+    alias: 'ignore-teams',
+    describe: 'When searching by user, ignore requests implied by team memberships',
+    nargs: 1,
+    type: 'boolean',
+    default: true
+  })
+  .example('$0 -s false', 'include requests implied by teams')
+
+  .option('c', {
+    alias: 'color',
+    describe: 'Enable colors',
+    nargs: 1,
+    type: 'boolean',
+    default: true
+  })
+  .example('$0 -c false', 'disable color output')
 
   .help('h')
   .alias('h', 'help')
@@ -53,6 +70,11 @@ const searchOrganization = argv.o;
 const searchRepositories = argv.r && !Array.isArray(argv.r) ? [argv.r] : argv.r; //ensure either array or undefined
 const searchUser = argv.u;
 const noUserMode = !!(searchOrganization || searchRepositories);
+const ignoreTeams = !noUserMode && argv.i;
+const enableColor = argv.c;
+if (!enableColor) {
+  colors.disable();
+}
 
 octokit.authenticate({
   type: 'token',
@@ -67,9 +89,16 @@ const getReviewRequested = (itemId, orgName, repoName, prNum) => {
       owner: orgName, repo: repoName, number: prNum, per_page: 1, page: 1
     }).then((res) => {
       if (res && res.data && res.data.users && res.data.teams) {
-        const count = res.data.users.length + res.data.teams.length;
-        if (count > 0) {
-          allPRs[itemId].statuses["requested"] = true;
+        if (ignoreTeams) {
+          const hasUser = res.data.users.find((u) => u.login === searchUser);
+          if (hasUser) {
+            allPRs[itemId].statuses["requested"] = true;
+          }
+        } else {
+          const count = res.data.users.length + res.data.teams.length;
+          if (count > 0) {
+            allPRs[itemId].statuses["requested"] = true;
+          }
         }
         resolve();
       } else {
@@ -119,7 +148,6 @@ const addQueryToList = (q, status) => {
           if (!allPRs[item.id].statuses) {
             allPRs[item.id].statuses = {};
           }
-          allPRs[item.id].statuses[status] = true;
 
           if (noUserMode) {
             //get the assigned data from the item, and do additional requests for reviewed & review-requested status
@@ -130,6 +158,12 @@ const addQueryToList = (q, status) => {
             }
             furtherQueryPromises.push(getReviewRequested(item.id, prOrgName, prRepoName, prNum));
             furtherQueryPromises.push(getReviewed(item.id, prOrgName, prRepoName, prNum));
+          } else {
+            if (status === 'requested') {
+              furtherQueryPromises.push(getReviewRequested(item.id, prOrgName, prRepoName, prNum));
+            } else {
+              allPRs[item.id].statuses[status] = true;
+            }
           }
         });
         Promise.all(furtherQueryPromises).then(resolve);
@@ -165,11 +199,17 @@ const sortItems = (items) => {
     return new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime();
   });
 }
+const isRelevantForUser = (a) => {
+  return a.statuses.created || a.statuses.reviewed || a.statuses.requested || a.statuses.assigned || a.statuses.mentioned;
+}
 
 const printItems = () => {
   console.log();
 
-  const allItems = Object.values(allPRs);
+  let allItems = Object.values(allPRs);
+  if (!noUserMode) {
+    allItems = allItems.filter(isRelevantForUser);
+  }
   // The special interest case: put unreviewed requested/assigned items at the top
   allItems.forEach((item)=>{
     item.statuses.awaiting = (item.statuses.assigned || item.statuses.requested) && !item.statuses.reviewed;
